@@ -1,16 +1,25 @@
+EXTERN ExitProcess:PROC
+EXTERN GetStdHandle:PROC
+EXTERN WriteFile:PROC
+
 .data
-    hello db 'Hello, World!', 10  ; 10 = newline
-    hello_len equ $ - hello        ; довжина рядка
+    hello db "Hello, World!", 10
+    hello_len equ $ - hello
 
 .code
 main PROC
-
-    ; write(1, hello, hello_len)
-    mov rcx, 1        ; file descriptor 1 = stdout
-    mov rsi, offset hello    ; адреса рядка
-    mov rdx, offset hello_len ; довжина рядка
-
-    ; exit(0)
-    xor rdi, rdi      ; код виходу 0
+    sub rsp, 56
+    mov ecx, -11
+    call GetStdHandle
+    mov rcx, rax
+    mov rdx, offset hello
+    mov r8d, hello_len
+    lea r9, [rsp+40]
+    mov dword ptr [rsp+40], 0
+    mov qword ptr [rsp+32], 0
+    call WriteFile
+    add rsp, 56
+    xor ecx, ecx
+    call ExitProcess
 main ENDP
 END

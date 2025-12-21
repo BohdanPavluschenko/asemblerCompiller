@@ -9,6 +9,7 @@
 #include <io.h>
 #include <direct.h>
 #include <map>
+#include <set>
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
@@ -160,7 +161,7 @@ vector<Token> lexer(const string& line) {
 
 // ------------------ Парсер ------------------
 
-Instructions parseLine(const vector<Token>& tokens, int lineNo, SymbolTable& table, int currentScope = 0, int& nextOffset = *(new int(-4))) {
+Instructions parseLine(const vector<Token>& tokens, int lineNo, SymbolTable& table, int currentScope, int& nextOffset) {
     Instructions out;
     out.lineNo = lineNo;
 
@@ -230,10 +231,16 @@ vector<Instructions> parseProgram(const vector<string>& lines, SymbolTable& tabl
 
 void generateASM(const vector<Instructions>& program, const SymbolTable& table, int totalStackSize) {
     ofstream outFile("program.asm");
+    int alignedStackSize = totalStackSize;
+    if (alignedStackSize % 16 != 0) {
+        alignedStackSize += 16 - (alignedStackSize % 16);
+    }
 
     outFile << ".code\n";
     outFile << "main PROC\n";
-    if (totalStackSize > 0) outFile << "    sub rsp, " << totalStackSize << "\n";
+    outFile << "    push rbp\n";
+    outFile << "    mov rbp, rsp\n";
+    if (alignedStackSize > 0) outFile << "    sub rsp, " << alignedStackSize << "\n";
 
     for (const auto& stmt : program) {
         if (stmt.kind != StmtKind::INSTR) continue;
@@ -262,13 +269,15 @@ void generateASM(const vector<Instructions>& program, const SymbolTable& table, 
             string retValue = stmt.args[0];
             if (isdigit(retValue[0])) outFile << "    mov eax, " << retValue << "\n";
             else { const Symbol* sym = table.find(retValue); if (!sym) continue; outFile << "    mov eax, [rbp" << sym->offset << "]\n"; }
-            outFile << "    add rsp, " << totalStackSize << "\n";
+            if (alignedStackSize > 0) outFile << "    add rsp, " << alignedStackSize << "\n";
+            outFile << "    pop rbp\n";
             outFile << "    ret\n";
         }
     }
 
-    outFile << "    add rsp, " << totalStackSize << "\n";
+    if (alignedStackSize > 0) outFile << "    add rsp, " << alignedStackSize << "\n";
     outFile << "    xor eax, eax\n";
+    outFile << "    pop rbp\n";
     outFile << "    ret\n";
     outFile << "main ENDP\n";
     outFile << "END\n";
@@ -310,12 +319,23 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
     bool inDataSection = false;
     bool inTextSection = false;
     bool hasMain = false;
+    set<string> equSymbols;
     
     for (const auto& line : lines) {
         string lowerLine = line;
         for (char& c : lowerLine) c = tolower(c);
         string trimmed = line;
         while (!trimmed.empty() && isspace(trimmed[0])) trimmed.erase(0, 1);
+        
+        if (inDataSection) {
+            size_t equPos = lowerLine.find(" equ ");
+            if (equPos != string::npos) {
+                string varName = trimmed.substr(0, equPos);
+                while (!varName.empty() && isspace(varName.back())) varName.pop_back();
+                for (char& c : varName) c = tolower(c);
+                equSymbols.insert(varName);
+            }
+        }
         
         // Конвертація section .data
         if (lowerLine.find("section .data") != string::npos) {
@@ -358,7 +378,8 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
             bool isWrite = false;
             
             // Перевіряємо останні 5 рядків
-            for (int j = converted.size() - 1; j >= 0 && j >= (int)converted.size() - 5; j--) {
+            size_t start = converted.size() > 5 ? converted.size() - 5 : 0;
+            for (size_t j = converted.size(); j-- > start;) {
                 string prevLower = converted[j];
                 for (char& c : prevLower) c = tolower(c);
                 if (prevLower.find("mov rax, 60") != string::npos || 
@@ -376,7 +397,8 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
             if (isExit) {
                 // Exit syscall - замінюємо на ExitProcess
                 bool foundExitCode = false;
-                for (int j = converted.size() - 1; j >= 0 && j >= (int)converted.size() - 5; j--) {
+                size_t exitStart = converted.size() > 5 ? converted.size() - 5 : 0;
+                for (size_t j = converted.size(); j-- > exitStart;) {
                     string prevLower = converted[j];
                     for (char& c : prevLower) c = tolower(c);
                     if (prevLower.find("mov edi") != string::npos || prevLower.find("mov rdi") != string::npos) {
@@ -410,16 +432,17 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
                 // rdi = fd (1 = stdout)
                 // rsi = buffer (offset msg)
                 // rdx = length
-                converted.push_back("    sub rsp, 40"); // Shadow space + local vars
+                converted.push_back("    sub rsp, 56"); // Shadow space + stack args + align
                 converted.push_back("    mov rcx, -11"); // STD_OUTPUT_HANDLE
                 converted.push_back("    call GetStdHandle");
                 converted.push_back("    mov rcx, rax"); // hFile (перший параметр)
-                converted.push_back("    mov rdx, rsi"); // lpBuffer (другий параметр - було в rsi)
                 converted.push_back("    mov r8, rdx"); // nNumberOfBytesToWrite (третій параметр)
-                converted.push_back("    lea r9, [rsp+32]"); // lpNumberOfBytesWritten (четвертий параметр - local var)
-                converted.push_back("    mov qword ptr [rsp+32], 0"); // Reserved (п'ятий параметр на стеку)
+                converted.push_back("    mov rdx, rsi"); // lpBuffer (другий параметр - було в rsi)
+                converted.push_back("    lea r9, [rsp+40]"); // lpNumberOfBytesWritten (четвертий параметр)
+                converted.push_back("    mov dword ptr [rsp+40], 0");
+                converted.push_back("    mov qword ptr [rsp+32], 0"); // lpOverlapped (п'ятий параметр)
                 converted.push_back("    call WriteFile");
-                converted.push_back("    add rsp, 40");
+                converted.push_back("    add rsp, 56");
                 continue;
             }
             // Інші syscall - просто видаляємо
@@ -463,6 +486,14 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
                         addrClean.find("ecx") == string::npos && addrClean.find("edx") == string::npos &&
                         addrClean.find("esi") == string::npos && addrClean.find("edi") == string::npos) {
                         isAddress = true;
+                    }
+                    
+                    if (isAddress) {
+                        string addrLower = addrClean;
+                        for (char& c : addrLower) c = tolower(c);
+                        if (equSymbols.find(addrLower) != equSymbols.end()) {
+                            isAddress = false;
+                        }
                     }
                     
                     if (isAddress) {
@@ -584,7 +615,7 @@ int main() {
         cout << "Parsing C-like code and generating assembly...\n";
     SymbolTable table;
     vector<Instructions> program = parseProgram(lines, table);
-    int totalStackSize = table.symbols.size() * 4;
+    int totalStackSize = static_cast<int>(table.symbols.size() * 4);
         generateASM(program, table, totalStackSize);
         cout << "Generated " << outputAsmFile << "\n";
     }
@@ -669,7 +700,130 @@ int main() {
     // Парсимо асемблерний код і конвертуємо в C++
     bool inCodeSection = false;
     bool inDataSection = false;
-    map<string, string> dataVars; // змінні з .data секції
+    struct DataVar {
+        enum class Kind { Bytes, Expr };
+        Kind kind;
+        string value;
+    };
+    auto trimCopy = [](string value) {
+        while (!value.empty() && isspace(static_cast<unsigned char>(value.front()))) value.erase(value.begin());
+        while (!value.empty() && isspace(static_cast<unsigned char>(value.back()))) value.pop_back();
+        return value;
+    };
+    auto normalizeNumeric = [&](string token) {
+        token = trimCopy(token);
+        if (token.empty()) return token;
+        bool negative = false;
+        if (token[0] == '-') {
+            negative = true;
+            token.erase(0, 1);
+        }
+        if (!token.empty()) {
+            char suffix = token.back();
+            if (suffix == 'h' || suffix == 'H') {
+                token.pop_back();
+                token = "0x" + token;
+            } else if (suffix == 'b' || suffix == 'B') {
+                token.pop_back();
+                token = "0b" + token;
+            }
+        }
+        if (negative) token = "-" + token;
+        return token;
+    };
+    auto parseDbValues = [&](const string& raw) {
+        vector<string> parts;
+        string current;
+        bool inSingle = false;
+        bool inDouble = false;
+        for (size_t i = 0; i < raw.size(); ++i) {
+            char ch = raw[i];
+            if (ch == '"' && !inSingle) {
+                inDouble = !inDouble;
+                current += ch;
+                continue;
+            }
+            if (ch == '\'' && !inDouble) {
+                inSingle = !inSingle;
+                current += ch;
+                continue;
+            }
+            if (ch == ',' && !inSingle && !inDouble) {
+                parts.push_back(current);
+                current.clear();
+                continue;
+            }
+            current += ch;
+        }
+        if (!current.empty()) parts.push_back(current);
+        vector<string> bytes;
+        auto byteToHex = [](unsigned char b) {
+            ostringstream oss;
+            oss << "0x" << hex << uppercase << setw(2) << setfill('0') << static_cast<int>(b);
+            return oss.str();
+        };
+        for (auto& part : parts) {
+            string token = trimCopy(part);
+            if (token.empty()) continue;
+            if (token.front() == '"' || token.front() == '\'') {
+                char quote = token.front();
+                if (token.size() >= 2 && token.back() == quote) {
+                    token = token.substr(1, token.size() - 2);
+                } else {
+                    token.erase(0, 1);
+                }
+                for (size_t i = 0; i < token.size(); ++i) {
+                    unsigned char ch = static_cast<unsigned char>(token[i]);
+                    if (ch == '\\' && i + 1 < token.size()) {
+                        char esc = token[++i];
+                        switch (esc) {
+                        case 'n': ch = '\n'; break;
+                        case 'r': ch = '\r'; break;
+                        case 't': ch = '\t'; break;
+                        case '0': ch = '\0'; break;
+                        case '\\': ch = '\\'; break;
+                        case '"': ch = '"'; break;
+                        case '\'': ch = '\''; break;
+                        case 'x': {
+                            int value = 0;
+                            int count = 0;
+                            while (i + 1 < token.size() &&
+                                   isxdigit(static_cast<unsigned char>(token[i + 1])) &&
+                                   count < 2) {
+                                char hexChar = token[++i];
+                                value *= 16;
+                                if (hexChar >= '0' && hexChar <= '9') value += hexChar - '0';
+                                else if (hexChar >= 'a' && hexChar <= 'f') value += hexChar - 'a' + 10;
+                                else if (hexChar >= 'A' && hexChar <= 'F') value += hexChar - 'A' + 10;
+                                count++;
+                            }
+                            ch = static_cast<unsigned char>(value);
+                            break;
+                        }
+                        default:
+                            ch = static_cast<unsigned char>(esc);
+                            break;
+                        }
+                    }
+                    bytes.push_back(byteToHex(ch));
+                }
+            } else {
+                bytes.push_back(normalizeNumeric(token));
+            }
+        }
+        string result;
+        for (size_t i = 0; i < bytes.size(); ++i) {
+            if (i > 0) result += ", ";
+            result += bytes[i];
+        }
+        return result;
+    };
+    map<string, DataVar> dataVars; // змінні з .data секції
+    vector<string> dataOrder;
+    auto addDataVar = [&](const string& name, const DataVar& var) {
+        if (dataVars.find(name) == dataVars.end()) dataOrder.push_back(name);
+        dataVars[name] = var;
+    };
     vector<string> codeLines;
     
     for (const auto& line : asmLines) {
@@ -704,8 +858,9 @@ int main() {
                 // Видаляємо коментарі
                 size_t commentPos = value.find(";");
                 if (commentPos != string::npos) value = value.substr(0, commentPos);
-                while (!value.empty() && isspace(value.back())) value.pop_back();
-                dataVars[varName] = value;
+                value = trimCopy(value);
+                string bytes = parseDbValues(value);
+                addDataVar(varName, { DataVar::Kind::Bytes, bytes });
             }
             // Парсимо equ (константи)
             size_t equPos = lowerLine.find(" equ ");
@@ -715,7 +870,7 @@ int main() {
                 string value = trimmed.substr(equPos + 5);
                 size_t commentPos = value.find(";");
                 if (commentPos != string::npos) value = value.substr(0, commentPos);
-                while (!value.empty() && isspace(value.back())) value.pop_back();
+                value = trimCopy(value);
                 // Обробляємо вирази типу $ - varName
                 if (value.find("$ -") != string::npos) {
                     // Це довжина рядка - обчислимо пізніше
@@ -724,10 +879,10 @@ int main() {
                         string refVar = value.substr(minusPos + 1);
                         while (!refVar.empty() && isspace(refVar[0])) refVar.erase(0, 1);
                         while (!refVar.empty() && isspace(refVar.back())) refVar.pop_back();
-                        dataVars[varName] = "sizeof(" + refVar + ")-1"; // Приблизна довжина
+                        addDataVar(varName, { DataVar::Kind::Expr, "sizeof(" + refVar + ")" });
                     }
                 } else {
-                    dataVars[varName] = value;
+                    addDataVar(varName, { DataVar::Kind::Expr, value });
                 }
             }
         }
@@ -741,33 +896,18 @@ int main() {
     // Генеруємо дані
     if (!dataVars.empty()) {
         wrapper << "// Data section\n";
-        for (const auto& var : dataVars) {
-            if (var.second.find("sizeof") != string::npos) {
-                // Це вираз для довжини
-                wrapper << "const int " << var.first << " = " << var.second << ";\n";
-            } else if (var.second.find("\"") != string::npos || var.second.find("'") != string::npos) {
-                // Рядок
-                string value = var.second;
-                // Замінюємо одинарні лапки на подвійні
-                size_t singleQuote = value.find("'");
-                if (singleQuote != string::npos && value.find("\"") == string::npos) {
-                    value.replace(singleQuote, 1, "\"");
-                    size_t lastQuote = value.find_last_of("'");
-                    if (lastQuote != string::npos && lastQuote != singleQuote) {
-                        value.replace(lastQuote, 1, "\"");
-                    }
-                }
-                wrapper << "const char " << var.first << "[] = " << value << ";\n";
-                // Додаємо змінну для довжини, якщо є _len версія
-                if (var.first.find("_len") == string::npos) {
-                    string lenVar = var.first + "_len";
+        for (const auto& name : dataOrder) {
+            const auto& var = dataVars[name];
+            if (var.kind == DataVar::Kind::Bytes) {
+                wrapper << "const unsigned char " << name << "[] = { " << var.value << " };\n";
+                if (name.find("_len") == string::npos) {
+                    string lenVar = name + "_len";
                     if (dataVars.find(lenVar) == dataVars.end()) {
-                        wrapper << "const int " << lenVar << " = sizeof(" << var.first << ") - 1;\n";
+                        wrapper << "const int " << lenVar << " = sizeof(" << name << ");\n";
                     }
                 }
             } else {
-                // Число або вираз
-                wrapper << "const int " << var.first << " = " << var.second << ";\n";
+                wrapper << "const int " << name << " = " << var.value << ";\n";
             }
         }
         wrapper << "\n";
@@ -781,6 +921,27 @@ int main() {
     bool usesExitProcess = false;
     bool usesGetStdHandle = false;
     string bufferVar, lengthVar;
+    string rsiVar, rdxVar, r8Var;
+    auto extractOperand = [&](const string& line) {
+        size_t commaPos = line.find(",");
+        if (commaPos == string::npos) return string();
+        string value = line.substr(commaPos + 1);
+        size_t commentPos = value.find(";");
+        if (commentPos != string::npos) value = value.substr(0, commentPos);
+        value = trimCopy(value);
+        string lower = value;
+        for (char& c : lower) c = tolower(c);
+        size_t offsetPos = lower.find("offset");
+        if (offsetPos != string::npos) {
+            value = value.substr(offsetPos + 6);
+            value = trimCopy(value);
+        }
+        if (!value.empty() && value.front() == '[' && value.back() == ']') {
+            value = value.substr(1, value.size() - 2);
+            value = trimCopy(value);
+        }
+        return value;
+    };
     
     for (const auto& codeLine : codeLines) {
         string lowerLine = codeLine;
@@ -790,38 +951,37 @@ int main() {
         if (lowerLine.find("getstdhandle") != string::npos) usesGetStdHandle = true;
         
         // Знаходимо змінні для WriteFile
-        if (lowerLine.find("mov rdx") != string::npos || lowerLine.find("mov r8") != string::npos) {
-            size_t commaPos = lowerLine.find(",");
-            if (commaPos != string::npos) {
-                string value = lowerLine.substr(commaPos + 1);
-                while (!value.empty() && isspace(value[0])) value.erase(0, 1);
-                size_t commentPos = value.find(";");
-                if (commentPos != string::npos) value = value.substr(0, commentPos);
-                while (!value.empty() && isspace(value.back())) value.pop_back();
-                if (dataVars.find(value) != dataVars.end()) {
-                    if (lowerLine.find("r8") != string::npos) lengthVar = value;
-                    else if (lowerLine.find("rdx") != string::npos) bufferVar = value;
-                }
-            }
-        }
         if (lowerLine.find("mov rsi") != string::npos || lowerLine.find("lea rsi") != string::npos) {
-            size_t commaPos = lowerLine.find(",");
-            if (commaPos != string::npos) {
-                string value = lowerLine.substr(commaPos + 1);
-                // Видаляємо offset
-                size_t offsetPos = value.find("offset");
-                if (offsetPos != string::npos) {
-                    value = value.substr(offsetPos + 6);
-                    while (!value.empty() && isspace(value[0])) value.erase(0, 1);
-                }
-                size_t commentPos = value.find(";");
-                if (commentPos != string::npos) value = value.substr(0, commentPos);
-                while (!value.empty() && isspace(value.back())) value.pop_back();
-                if (dataVars.find(value) != dataVars.end()) {
-                    bufferVar = value;
-                }
+            string value = extractOperand(codeLine);
+            if (!value.empty() && dataVars.find(value) != dataVars.end()) {
+                rsiVar = value;
             }
         }
+        if (lowerLine.find("mov rdx") != string::npos || lowerLine.find("lea rdx") != string::npos) {
+            string value = extractOperand(codeLine);
+            if (!value.empty() && dataVars.find(value) != dataVars.end()) {
+                rdxVar = value;
+            }
+        }
+        if (lowerLine.find("mov r8") != string::npos || lowerLine.find("lea r8") != string::npos) {
+            string value = extractOperand(codeLine);
+            if (!value.empty() && dataVars.find(value) != dataVars.end()) {
+                r8Var = value;
+            }
+        }
+    }
+    
+    if (!r8Var.empty()) {
+        lengthVar = r8Var;
+        if (!rdxVar.empty()) bufferVar = rdxVar;
+        else if (!rsiVar.empty()) bufferVar = rsiVar;
+    } else if (!rsiVar.empty() && !rdxVar.empty()) {
+        bufferVar = rsiVar;
+        lengthVar = rdxVar;
+    } else if (!rdxVar.empty()) {
+        bufferVar = rdxVar;
+    } else if (!rsiVar.empty()) {
+        bufferVar = rsiVar;
     }
     
     // Генеруємо код
@@ -855,7 +1015,7 @@ int main() {
                 if (lenVar == "msg" || lenVar == "hello") lenVar = "len";
                 else if (lenVar.find("msg") != string::npos) lenVar = lenVar + "_len";
                 wrapper << "    DWORD written;\n";
-                wrapper << "    WriteFile(hStdOut, " << bufferVar << ", sizeof(" << bufferVar << ")-1, &written, NULL);\n";
+                wrapper << "    WriteFile(hStdOut, " << bufferVar << ", sizeof(" << bufferVar << "), &written, NULL);\n";
             }
         } else if (lowerLine.find("ret") != string::npos && i == codeLines.size() - 1) {
             // Останній ret

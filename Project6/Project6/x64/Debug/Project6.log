@@ -1,0 +1,7 @@
+﻿  Source.cpp
+D:\Documents\files-manager\Project6\Project6\Source.cpp(361,24): warning C4267: инициализация: преобразование из "size_t" в "int"; возможна потеря данных
+D:\Documents\files-manager\Project6\Project6\Source.cpp(379,28): warning C4267: инициализация: преобразование из "size_t" в "int"; возможна потеря данных
+D:\Documents\files-manager\Project6\Project6\Source.cpp(587,24): warning C4267: инициализация: преобразование из "size_t" в "int"; возможна потеря данных
+  Project6.vcxproj -> D:\Documents\files-manager\Project6\x64\Debug\Project6.exe
+  "pwsh.exe" не является внутренней или внешней
+  командой, исполняемой программой или пакетным файлом.

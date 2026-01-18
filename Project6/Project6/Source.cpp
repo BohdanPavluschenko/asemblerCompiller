@@ -11,7 +11,6 @@
 #include <map>
 #include <set>
 #include <algorithm>
-#include <sstream>
 #include <iomanip>
 using namespace std;
 
@@ -40,7 +39,7 @@ string findMasmPath() {
     if (system(testCmd.c_str()) == 0) {
         return "ml64.exe";
     }
-    
+
     // 2. Перевіряємо VCINSTALLDIR
     string vsPath = getEnvVar("VCINSTALLDIR");
     if (!vsPath.empty()) {
@@ -49,7 +48,7 @@ string findMasmPath() {
             return masmPath;
         }
     }
-    
+
     // 3. Перевіряємо стандартні місця Visual Studio
     vector<string> commonPaths = {
         "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\",
@@ -62,7 +61,7 @@ string findMasmPath() {
         "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Professional\\VC\\Tools\\MSVC\\",
         "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Enterprise\\VC\\Tools\\MSVC\\"
     };
-    
+
     for (const auto& basePath : commonPaths) {
         // Шукаємо в підпапках MSVC
         string searchCmd = "dir /b /s \"" + basePath + "*\\bin\\Hostx64\\x64\\ml64.exe\" 2>nul";
@@ -71,16 +70,24 @@ string findMasmPath() {
             char buffer[512];
             if (fgets(buffer, sizeof(buffer), pipe)) {
                 string result(buffer);
-                result.erase(result.find_last_not_of(" \n\r\t") + 1);
+                size_t lastPos = result.find_last_not_of(" \n\r\t");
+                if (lastPos != string::npos) {
+                    result.erase(lastPos + 1);
+                }
+                else {
+                    result.clear();
+                }
                 _pclose(pipe);
-                if (fileExists(result)) {
+                if (!result.empty() && fileExists(result)) {
                     return result;
                 }
             }
-            _pclose(pipe);
+            else {
+                _pclose(pipe);
+            }
         }
     }
-    
+
     return "";
 }
 
@@ -248,27 +255,70 @@ void generateASM(const vector<Instructions>& program, const SymbolTable& table, 
         if (stmt.name == "decl") continue;
 
         if (stmt.name == "assign") {
+            if (stmt.args.size() < 3) continue;
             string dest = stmt.args[0], value = stmt.args[2];
             const Symbol* symDest = table.find(dest); if (!symDest) continue;
-            if (isdigit(value[0])) outFile << "    mov eax, " << value << "\n";
-            else { const Symbol* symValue = table.find(value); if (!symValue) continue; outFile << "    mov eax, [rbp" << symValue->offset << "]\n"; }
+            if (isdigit(value[0]) || (value[0] == '-' && value.size() > 1 && isdigit(value[1]))) {
+                outFile << "    mov eax, " << value << "\n";
+            }
+            else {
+                const Symbol* symValue = table.find(value);
+                if (!symValue) {
+                    cerr << "Warning: value variable '" << value << "' not found (line " << stmt.lineNo << ")\n";
+                    continue;
+                }
+                outFile << "    mov eax, [rbp" << symValue->offset << "]\n";
+            }
             outFile << "    mov [rbp" << symDest->offset << "], eax\n"; continue;
         }
 
         if (stmt.args.size() == 5 && stmt.args[1] == "=") {
             string dest = stmt.args[0], left = stmt.args[2], op = stmt.args[3], right = stmt.args[4];
-            const Symbol* sDest = table.find(dest); if (!sDest) continue;
-            if (isdigit(left[0])) outFile << "    mov eax, " << left << "\n";
-            else { const Symbol* sLeft = table.find(left); if (!sLeft) continue; outFile << "    mov eax, [rbp" << sLeft->offset << "]\n"; }
-            if (isdigit(right[0])) { if (op == "+") outFile << "    add eax, " << right << "\n"; else if (op == "-") outFile << "    sub eax, " << right << "\n"; }
-            else { const Symbol* sRight = table.find(right); if (!sRight) continue; if (op == "+") outFile << "    add eax, [rbp" << sRight->offset << "]\n"; else if (op == "-") outFile << "    sub eax, [rbp" << sRight->offset << "]\n"; }
+            const Symbol* sDest = table.find(dest);
+            if (!sDest) {
+                cerr << "Warning: destination variable '" << dest << "' not found (line " << stmt.lineNo << ")\n";
+                continue;
+            }
+            if (isdigit(left[0]) || (left[0] == '-' && left.size() > 1 && isdigit(left[1]))) {
+                outFile << "    mov eax, " << left << "\n";
+            }
+            else {
+                const Symbol* sLeft = table.find(left);
+                if (!sLeft) {
+                    cerr << "Warning: left operand '" << left << "' not found (line " << stmt.lineNo << ")\n";
+                    continue;
+                }
+                outFile << "    mov eax, [rbp" << sLeft->offset << "]\n";
+            }
+            if (isdigit(right[0]) || (right[0] == '-' && right.size() > 1 && isdigit(right[1]))) {
+                if (op == "+") outFile << "    add eax, " << right << "\n";
+                else if (op == "-") outFile << "    sub eax, " << right << "\n";
+            }
+            else {
+                const Symbol* sRight = table.find(right);
+                if (!sRight) {
+                    cerr << "Warning: right operand '" << right << "' not found (line " << stmt.lineNo << ")\n";
+                    continue;
+                }
+                if (op == "+") outFile << "    add eax, [rbp" << sRight->offset << "]\n";
+                else if (op == "-") outFile << "    sub eax, [rbp" << sRight->offset << "]\n";
+            }
             outFile << "    mov [rbp" << sDest->offset << "], eax\n"; continue;
         }
 
         if (stmt.name == "return") {
             string retValue = stmt.args[0];
-            if (isdigit(retValue[0])) outFile << "    mov eax, " << retValue << "\n";
-            else { const Symbol* sym = table.find(retValue); if (!sym) continue; outFile << "    mov eax, [rbp" << sym->offset << "]\n"; }
+            if (isdigit(retValue[0]) || (retValue[0] == '-' && retValue.size() > 1 && isdigit(retValue[1]))) {
+                outFile << "    mov eax, " << retValue << "\n";
+            }
+            else {
+                const Symbol* sym = table.find(retValue);
+                if (!sym) {
+                    cerr << "Warning: return value '" << retValue << "' not found (line " << stmt.lineNo << ")\n";
+                    continue;
+                }
+                outFile << "    mov eax, [rbp" << sym->offset << "]\n";
+            }
             if (alignedStackSize > 0) outFile << "    add rsp, " << alignedStackSize << "\n";
             outFile << "    pop rbp\n";
             outFile << "    ret\n";
@@ -291,7 +341,7 @@ bool isAssemblyFile(const vector<string>& lines) {
     for (const auto& line : lines) {
         string lowerLine = line;
         for (char& c : lowerLine) c = tolower(c);
-        
+
         if (lowerLine.find("section") != string::npos ||
             lowerLine.find(".code") != string::npos ||
             lowerLine.find(".data") != string::npos ||
@@ -320,13 +370,13 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
     bool inTextSection = false;
     bool hasMain = false;
     set<string> equSymbols;
-    
+
     for (const auto& line : lines) {
         string lowerLine = line;
         for (char& c : lowerLine) c = tolower(c);
         string trimmed = line;
         while (!trimmed.empty() && isspace(trimmed[0])) trimmed.erase(0, 1);
-        
+
         if (inDataSection) {
             size_t equPos = lowerLine.find(" equ ");
             if (equPos != string::npos) {
@@ -336,7 +386,7 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
                 equSymbols.insert(varName);
             }
         }
-        
+
         // Конвертація section .data
         if (lowerLine.find("section .data") != string::npos) {
             converted.push_back(".data");
@@ -344,7 +394,7 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
             inTextSection = false;
             continue;
         }
-        
+
         // Конвертація section .text
         if (lowerLine.find("section .text") != string::npos) {
             converted.push_back(".code");
@@ -352,7 +402,7 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
             inTextSection = true;
             continue;
         }
-        
+
         // Конвертація global _start
         if (lowerLine.find("global _start") != string::npos) {
             if (!hasMain) {
@@ -361,7 +411,7 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
             }
             continue;
         }
-        
+
         // Конвертація _start:
         if (lowerLine.find("_start:") != string::npos) {
             if (!hasMain) {
@@ -370,30 +420,30 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
             }
             continue;
         }
-        
+
         // Конвертація syscall на Windows API
         if (lowerLine.find("syscall") != string::npos) {
             // Перевіряємо попередні рядки для визначення типу syscall
             bool isExit = false;
             bool isWrite = false;
-            
+
             // Перевіряємо останні 5 рядків
             size_t start = converted.size() > 5 ? converted.size() - 5 : 0;
             for (size_t j = converted.size(); j-- > start;) {
                 string prevLower = converted[j];
                 for (char& c : prevLower) c = tolower(c);
-                if (prevLower.find("mov rax, 60") != string::npos || 
+                if (prevLower.find("mov rax, 60") != string::npos ||
                     prevLower.find("mov eax, 60") != string::npos) {
                     isExit = true;
                     break;
                 }
-                if (prevLower.find("mov rax, 1") != string::npos || 
+                if (prevLower.find("mov rax, 1") != string::npos ||
                     prevLower.find("mov eax, 1") != string::npos) {
                     isWrite = true;
                     break;
                 }
             }
-            
+
             if (isExit) {
                 // Exit syscall - замінюємо на ExitProcess
                 bool foundExitCode = false;
@@ -407,13 +457,15 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
                         size_t rdiPos = prevLine.find("rdi");
                         if (ediPos != string::npos) {
                             prevLine.replace(ediPos, 3, "ecx");
-                        } else if (rdiPos != string::npos) {
+                        }
+                        else if (rdiPos != string::npos) {
                             prevLine.replace(rdiPos, 3, "rcx");
                         }
                         converted[j] = prevLine;
                         foundExitCode = true;
                         break;
-                    } else if (prevLower.find("xor edi") != string::npos || prevLower.find("xor rdi") != string::npos) {
+                    }
+                    else if (prevLower.find("xor edi") != string::npos || prevLower.find("xor rdi") != string::npos) {
                         converted[j] = "    mov ecx, 0";
                         foundExitCode = true;
                         break;
@@ -424,7 +476,8 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
                 }
                 converted.push_back("    call ExitProcess");
                 continue;
-            } else if (isWrite) {
+            }
+            else if (isWrite) {
                 // Write syscall - замінюємо на WriteFile
                 // Linux: rax=1, rdi=fd, rsi=buffer, rdx=length
                 // Windows: WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, ...)
@@ -448,10 +501,10 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
             // Інші syscall - просто видаляємо
             continue;
         }
-        
+
         // Конвертація регістрів та адрес для Windows calling convention
         string convertedLine = line;
-        
+
         // Виправляємо mov з адресами - додаємо offset
         // mov rsi, msg -> mov rsi, offset msg
         if (lowerLine.find("mov ") != string::npos) {
@@ -464,7 +517,7 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
                     size_t addrStart = 0;
                     while (addrStart < addrPart.length() && isspace(addrPart[addrStart])) addrStart++;
                     string addrClean = addrPart.substr(addrStart);
-                    
+
                     // Видаляємо коментарі
                     size_t commentPos = addrClean.find(";");
                     if (commentPos != string::npos) {
@@ -472,11 +525,11 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
                     }
                     // Видаляємо пробіли в кінці
                     while (!addrClean.empty() && isspace(addrClean.back())) addrClean.pop_back();
-                    
+
                     // Перевіряємо чи це адреса (не число, не регістр, не вже offset)
                     bool isAddress = false;
-                    if (!addrClean.empty() && !isdigit(addrClean[0]) && addrClean[0] != '-' && 
-                        addrClean.find("[") == string::npos && 
+                    if (!addrClean.empty() && !isdigit(addrClean[0]) && addrClean[0] != '-' &&
+                        addrClean.find("[") == string::npos &&
                         addrClean.find("offset") == string::npos &&
                         addrClean.find("rax") == string::npos && addrClean.find("rbx") == string::npos &&
                         addrClean.find("rcx") == string::npos && addrClean.find("rdx") == string::npos &&
@@ -487,7 +540,7 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
                         addrClean.find("esi") == string::npos && addrClean.find("edi") == string::npos) {
                         isAddress = true;
                     }
-                    
+
                     if (isAddress) {
                         string addrLower = addrClean;
                         for (char& c : addrLower) c = tolower(c);
@@ -495,7 +548,7 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
                             isAddress = false;
                         }
                     }
-                    
+
                     if (isAddress) {
                         // Додаємо offset перед адресою
                         size_t commaPosOrig = convertedLine.find(",", movPos);
@@ -510,7 +563,7 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
                 }
             }
         }
-        
+
         // edi -> ecx для першого аргументу в Windows (але не для адрес)
         if (lowerLine.find("mov edi") != string::npos || lowerLine.find("mov rdi") != string::npos) {
             if (convertedLine.find("offset") == string::npos) {
@@ -518,15 +571,16 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
                 size_t rdiPos = convertedLine.find("rdi");
                 if (ediPos != string::npos) {
                     convertedLine.replace(ediPos, 3, "ecx");
-                } else if (rdiPos != string::npos) {
+                }
+                else if (rdiPos != string::npos) {
                     convertedLine.replace(rdiPos, 3, "rcx");
                 }
             }
         }
-        
+
         converted.push_back(convertedLine);
     }
-    
+
     // Додаємо main PROC якщо його не було
     if (!hasMain && inTextSection) {
         vector<string> result;
@@ -538,7 +592,8 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
                 result.push_back(line);
                 result.push_back("main PROC");
                 foundCode = true;
-            } else {
+            }
+            else {
                 result.push_back(line);
             }
         }
@@ -548,7 +603,7 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
         }
         converted = result;
     }
-    
+
     // Додаємо ENDP та END
     if (hasMain || inTextSection) {
         // Перевіряємо чи вже є ENDP
@@ -566,7 +621,7 @@ vector<string> convertToWindowsMASM(const vector<string>& lines) {
         }
         converted.push_back("END");
     }
-    
+
     return converted;
 }
 
@@ -598,7 +653,7 @@ int main() {
     inFile.close();
 
     string outputAsmFile = "program.asm";
-    
+
     // 3. Перевірка чи файл вже є асемблерним
     if (isAssemblyFile(lines)) {
         // Якщо файл вже асемблерний - конвертуємо на Windows MASM стиль
@@ -610,12 +665,13 @@ int main() {
         }
         outFile.close();
         cout << "Converted and saved to " << outputAsmFile << "\n";
-    } else {
+    }
+    else {
         // Якщо це C-подібний код - парсимо і генеруємо ASM
         cout << "Parsing C-like code and generating assembly...\n";
-    SymbolTable table;
-    vector<Instructions> program = parseProgram(lines, table);
-    int totalStackSize = static_cast<int>(table.symbols.size() * 4);
+        SymbolTable table;
+        vector<Instructions> program = parseProgram(lines, table);
+        int totalStackSize = static_cast<int>(table.symbols.size() * 4);
         generateASM(program, table, totalStackSize);
         cout << "Generated " << outputAsmFile << "\n";
     }
@@ -624,11 +680,11 @@ int main() {
     ifstream checkFile(outputAsmFile);
     string fileContent((istreambuf_iterator<char>(checkFile)), istreambuf_iterator<char>());
     checkFile.close();
-    
+
     // Перевіряємо чи потрібно додати Windows API функції
     string lowerContent = fileContent;
     for (char& c : lowerContent) c = tolower(c);
-    
+
     vector<string> externsToAdd;
     if (lowerContent.find("exitprocess") != string::npos && lowerContent.find("extern exitprocess") == string::npos) {
         externsToAdd.push_back("EXTERN ExitProcess:PROC");
@@ -639,7 +695,7 @@ int main() {
     if (lowerContent.find("writefile") != string::npos && lowerContent.find("extern writefile") == string::npos) {
         externsToAdd.push_back("EXTERN WriteFile:PROC");
     }
-    
+
     if (!externsToAdd.empty()) {
         // Додаємо EXTERN на початку файлу
         vector<string> fileLines;
@@ -648,7 +704,7 @@ int main() {
         while (getline(ss, fileLine)) {
             fileLines.push_back(fileLine);
         }
-        
+
         // Вставляємо EXTERN перед .code або на початку
         bool inserted = false;
         vector<string> newLines;
@@ -668,17 +724,17 @@ int main() {
                 newLines.insert(newLines.begin(), ext);
             }
         }
-        
+
         ofstream rewriteFile(outputAsmFile);
         for (const auto& l : newLines) {
             rewriteFile << l << "\n";
         }
         rewriteFile.close();
     }
-    
+
     // 5. Компіляція через власний асемблер (без NASM/MASM)
     cout << "Compiling assembly using built-in assembler...\n";
-    
+
     // Читаємо асемблерний файл
     ifstream asmFile(outputAsmFile);
     vector<string> asmLines;
@@ -687,16 +743,24 @@ int main() {
         asmLines.push_back(asmLine);
     }
     asmFile.close();
-    
+
     // Генеруємо C++ обгортку
     string cppWrapper = "program_wrapper.cpp";
-    ofstream wrapper(cppWrapper);
-    
-    wrapper << "// Auto-generated C++ wrapper for assembly code\n";
-    wrapper << "#include <windows.h>\n";
-    wrapper << "#include <iostream>\n";
-    wrapper << "using namespace std;\n\n";
-    
+    ofstream wrapper(cppWrapper, ios::out | ios::trunc);
+    if (!wrapper.is_open()) {
+        cerr << "Error: Could not create wrapper file " << cppWrapper << "\n";
+        return 1;
+    }
+
+    // Записуємо заголовки без пробілів перед #, використовуючи прямий запис
+    wrapper << "// Auto-generated C++ wrapper for assembly code" << '\n';
+    wrapper << "#include <windows.h>" << '\n';
+    wrapper << "#include <iostream>" << '\n';
+    wrapper << "#include <string>" << '\n';
+    wrapper << '\n';
+    wrapper << "using namespace std;" << '\n';
+    wrapper << '\n';
+
     // Парсимо асемблерний код і конвертуємо в C++
     bool inCodeSection = false;
     bool inDataSection = false;
@@ -709,7 +773,7 @@ int main() {
         while (!value.empty() && isspace(static_cast<unsigned char>(value.front()))) value.erase(value.begin());
         while (!value.empty() && isspace(static_cast<unsigned char>(value.back()))) value.pop_back();
         return value;
-    };
+        };
     auto normalizeNumeric = [&](string token) {
         token = trimCopy(token);
         if (token.empty()) return token;
@@ -723,14 +787,15 @@ int main() {
             if (suffix == 'h' || suffix == 'H') {
                 token.pop_back();
                 token = "0x" + token;
-            } else if (suffix == 'b' || suffix == 'B') {
+            }
+            else if (suffix == 'b' || suffix == 'B') {
                 token.pop_back();
                 token = "0b" + token;
             }
         }
         if (negative) token = "-" + token;
         return token;
-    };
+        };
     auto parseDbValues = [&](const string& raw) {
         vector<string> parts;
         string current;
@@ -761,7 +826,7 @@ int main() {
             ostringstream oss;
             oss << "0x" << hex << uppercase << setw(2) << setfill('0') << static_cast<int>(b);
             return oss.str();
-        };
+            };
         for (auto& part : parts) {
             string token = trimCopy(part);
             if (token.empty()) continue;
@@ -769,7 +834,8 @@ int main() {
                 char quote = token.front();
                 if (token.size() >= 2 && token.back() == quote) {
                     token = token.substr(1, token.size() - 2);
-                } else {
+                }
+                else {
                     token.erase(0, 1);
                 }
                 for (size_t i = 0; i < token.size(); ++i) {
@@ -788,8 +854,8 @@ int main() {
                             int value = 0;
                             int count = 0;
                             while (i + 1 < token.size() &&
-                                   isxdigit(static_cast<unsigned char>(token[i + 1])) &&
-                                   count < 2) {
+                                isxdigit(static_cast<unsigned char>(token[i + 1])) &&
+                                count < 2) {
                                 char hexChar = token[++i];
                                 value *= 16;
                                 if (hexChar >= '0' && hexChar <= '9') value += hexChar - '0';
@@ -807,7 +873,8 @@ int main() {
                     }
                     bytes.push_back(byteToHex(ch));
                 }
-            } else {
+            }
+            else {
                 bytes.push_back(normalizeNumeric(token));
             }
         }
@@ -817,24 +884,27 @@ int main() {
             result += bytes[i];
         }
         return result;
-    };
+        };
     map<string, DataVar> dataVars; // змінні з .data секції
     vector<string> dataOrder;
     auto addDataVar = [&](const string& name, const DataVar& var) {
         if (dataVars.find(name) == dataVars.end()) dataOrder.push_back(name);
         dataVars[name] = var;
-    };
+        };
     vector<string> codeLines;
-    
+
     for (const auto& line : asmLines) {
         string lowerLine = line;
         for (char& c : lowerLine) c = tolower(c);
         string trimmed = line;
         while (!trimmed.empty() && isspace(trimmed[0])) trimmed.erase(0, 1);
-        
+
         // Пропускаємо коментарі та порожні рядки
         if (trimmed.empty() || trimmed[0] == ';') continue;
-        
+
+        // Пропускаємо EXTERN директиви
+        if (lowerLine.find("extern") != string::npos) continue;
+
         // Секції
         if (lowerLine.find(".data") != string::npos) {
             inDataSection = true;
@@ -846,76 +916,151 @@ int main() {
             inDataSection = false;
             continue;
         }
-        
+
         // Дані
         if (inDataSection) {
             // Парсимо визначення даних (наприклад: msg db "Hello", 0xA)
-            size_t dbPos = lowerLine.find(" db ");
-            if (dbPos != string::npos) {
-                string varName = trimmed.substr(0, dbPos);
-                while (!varName.empty() && isspace(varName.back())) varName.pop_back();
-                string value = trimmed.substr(dbPos + 4);
+            // Шукаємо "db" в рядку (може бути з пробілами або табуляцією)
+            size_t dbPosOrig = string::npos;
+            size_t dbPosLower = lowerLine.find("db");
+
+            if (dbPosLower != string::npos) {
+                // Перевіряємо, чи перед "db" є пробіл або табуляція
+                if (dbPosLower > 0 && (isspace(static_cast<unsigned char>(lowerLine[dbPosLower - 1])) ||
+                    lowerLine[dbPosLower - 1] == '\t')) {
+                    dbPosOrig = line.find("db");
+                    if (dbPosOrig == string::npos) dbPosOrig = line.find("DB");
+                }
+            }
+
+            if (dbPosOrig != string::npos && dbPosOrig > 0) {
+                // Знаходимо ім'я змінної (все до "db")
+                string varName = line.substr(0, dbPosOrig);
+                varName = trimCopy(varName);
+
+                // Знаходимо позицію після "db"
+                size_t valueStart = dbPosOrig;
+                // Шукаємо "db" або "DB"
+                if (line[valueStart] == 'd' || line[valueStart] == 'D') {
+                    if (valueStart + 1 < line.length() && (line[valueStart + 1] == 'b' || line[valueStart + 1] == 'B')) {
+                        valueStart += 2;
+                        // Пропускаємо пробіли після "db"
+                        while (valueStart < line.length() && isspace(static_cast<unsigned char>(line[valueStart]))) {
+                            valueStart++;
+                        }
+                    }
+                }
+
+                string value = line.substr(valueStart);
                 // Видаляємо коментарі
                 size_t commentPos = value.find(";");
                 if (commentPos != string::npos) value = value.substr(0, commentPos);
                 value = trimCopy(value);
-                string bytes = parseDbValues(value);
-                addDataVar(varName, { DataVar::Kind::Bytes, bytes });
-            }
-            // Парсимо equ (константи)
-            size_t equPos = lowerLine.find(" equ ");
-            if (equPos != string::npos) {
-                string varName = trimmed.substr(0, equPos);
-                while (!varName.empty() && isspace(varName.back())) varName.pop_back();
-                string value = trimmed.substr(equPos + 5);
-                size_t commentPos = value.find(";");
-                if (commentPos != string::npos) value = value.substr(0, commentPos);
-                value = trimCopy(value);
-                // Обробляємо вирази типу $ - varName
-                if (value.find("$ -") != string::npos) {
-                    // Це довжина рядка - обчислимо пізніше
-                    size_t minusPos = value.find("-");
-                    if (minusPos != string::npos) {
-                        string refVar = value.substr(minusPos + 1);
-                        while (!refVar.empty() && isspace(refVar[0])) refVar.erase(0, 1);
-                        while (!refVar.empty() && isspace(refVar.back())) refVar.pop_back();
-                        addDataVar(varName, { DataVar::Kind::Expr, "sizeof(" + refVar + ")" });
+                if (!value.empty() && !varName.empty()) {
+                    string bytes = parseDbValues(value);
+                    if (!bytes.empty()) {
+                        addDataVar(varName, { DataVar::Kind::Bytes, bytes });
                     }
-                } else {
-                    addDataVar(varName, { DataVar::Kind::Expr, value });
+                }
+                continue; // Важливо - пропускаємо цей рядок, щоб він не потрапив у код
+            }
+
+            // Парсимо equ (константи)
+            size_t equPosLower = lowerLine.find("equ");
+            if (equPosLower != string::npos && equPosLower > 0) {
+                // Перевіряємо, чи перед "equ" є пробіл або табуляція
+                if (isspace(static_cast<unsigned char>(lowerLine[equPosLower - 1])) ||
+                    lowerLine[equPosLower - 1] == '\t') {
+                    size_t equPosOrig = line.find("equ");
+                    if (equPosOrig == string::npos) equPosOrig = line.find("EQU");
+
+                    if (equPosOrig != string::npos && equPosOrig > 0) {
+                        // Знаходимо ім'я змінної (все до "equ")
+                        string varName = line.substr(0, equPosOrig);
+                        varName = trimCopy(varName);
+
+                        // Знаходимо позицію після "equ"
+                        size_t valueStart = equPosOrig;
+                        if (line[valueStart] == 'e' || line[valueStart] == 'E') {
+                            if (valueStart + 2 < line.length() &&
+                                (line[valueStart + 1] == 'q' || line[valueStart + 1] == 'Q') &&
+                                (line[valueStart + 2] == 'u' || line[valueStart + 2] == 'U')) {
+                                valueStart += 3;
+                                // Пропускаємо пробіли після "equ"
+                                while (valueStart < line.length() && isspace(static_cast<unsigned char>(line[valueStart]))) {
+                                    valueStart++;
+                                }
+                            }
+                        }
+
+                        string value = line.substr(valueStart);
+                        size_t commentPos = value.find(";");
+                        if (commentPos != string::npos) value = value.substr(0, commentPos);
+                        value = trimCopy(value);
+
+                        // Обробляємо вирази типу $ - varName
+                        if (value.find("$ -") != string::npos || value.find("$-") != string::npos) {
+                            // Це довжина рядка - обчислимо пізніше
+                            size_t minusPos = value.find("-");
+                            if (minusPos != string::npos) {
+                                string refVar = value.substr(minusPos + 1);
+                                refVar = trimCopy(refVar);
+                                if (!refVar.empty() && !varName.empty()) {
+                                    addDataVar(varName, { DataVar::Kind::Expr, "sizeof(" + refVar + ")" });
+                                }
+                            }
+                        }
+                        else if (!value.empty() && !varName.empty()) {
+                            addDataVar(varName, { DataVar::Kind::Expr, value });
+                        }
+                        continue; // Важливо - пропускаємо цей рядок
+                    }
                 }
             }
+            continue; // Пропускаємо всі інші рядки в .data секції
         }
-        
+
         // Код
         if (inCodeSection) {
+            // Пропускаємо PROC/ENDP/END
+            if (lowerLine.find("proc") != string::npos || lowerLine.find("endp") != string::npos) continue;
+            if (lowerLine.find("end") != string::npos && trimmed.length() <= 5) continue;
             codeLines.push_back(line);
         }
     }
-    
+
     // Генеруємо дані
     if (!dataVars.empty()) {
-        wrapper << "// Data section\n";
+        wrapper << "// Data section" << '\n';
         for (const auto& name : dataOrder) {
             const auto& var = dataVars[name];
             if (var.kind == DataVar::Kind::Bytes) {
-                wrapper << "const unsigned char " << name << "[] = { " << var.value << " };\n";
+                // Перевіряємо, чи ім'я змінної валідне
+                if (name.empty() || !isalpha(static_cast<unsigned char>(name[0]))) {
+                    continue; // Пропускаємо невалідні імена
+                }
+                wrapper << "const unsigned char " << name << "[] = { " << var.value << " };" << '\n';
                 if (name.find("_len") == string::npos) {
                     string lenVar = name + "_len";
                     if (dataVars.find(lenVar) == dataVars.end()) {
-                        wrapper << "const int " << lenVar << " = sizeof(" << name << ");\n";
+                        wrapper << "const int " << lenVar << " = sizeof(" << name << ");" << '\n';
                     }
                 }
-            } else {
-                wrapper << "const int " << name << " = " << var.value << ";\n";
+            }
+            else {
+                // Перевіряємо, чи ім'я змінної валідне
+                if (name.empty() || !isalpha(static_cast<unsigned char>(name[0]))) {
+                    continue; // Пропускаємо невалідні імена
+                }
+                wrapper << "const int " << name << " = " << var.value << ";" << '\n';
             }
         }
-        wrapper << "\n";
+        wrapper << '\n';
     }
-    
+
     // Генеруємо функцію main
-    wrapper << "int main() {\n";
-    
+    wrapper << "int main() {" << '\n';
+
     // Аналізуємо код для визначення використовуваних функцій та змінних
     bool usesWriteFile = false;
     bool usesExitProcess = false;
@@ -941,15 +1086,15 @@ int main() {
             value = trimCopy(value);
         }
         return value;
-    };
-    
+        };
+
     for (const auto& codeLine : codeLines) {
         string lowerLine = codeLine;
         for (char& c : lowerLine) c = tolower(c);
         if (lowerLine.find("writefile") != string::npos) usesWriteFile = true;
         if (lowerLine.find("exitprocess") != string::npos) usesExitProcess = true;
         if (lowerLine.find("getstdhandle") != string::npos) usesGetStdHandle = true;
-        
+
         // Знаходимо змінні для WriteFile
         if (lowerLine.find("mov rsi") != string::npos || lowerLine.find("lea rsi") != string::npos) {
             string value = extractOperand(codeLine);
@@ -970,25 +1115,28 @@ int main() {
             }
         }
     }
-    
+
     if (!r8Var.empty()) {
         lengthVar = r8Var;
         if (!rdxVar.empty()) bufferVar = rdxVar;
         else if (!rsiVar.empty()) bufferVar = rsiVar;
-    } else if (!rsiVar.empty() && !rdxVar.empty()) {
+    }
+    else if (!rsiVar.empty() && !rdxVar.empty()) {
         bufferVar = rsiVar;
         lengthVar = rdxVar;
-    } else if (!rdxVar.empty()) {
+    }
+    else if (!rdxVar.empty()) {
         bufferVar = rdxVar;
-    } else if (!rsiVar.empty()) {
+    }
+    else if (!rsiVar.empty()) {
         bufferVar = rsiVar;
     }
-    
+
     // Генеруємо код
     if (usesGetStdHandle) {
-        wrapper << "    HANDLE hStdOut = GetStdHandle(STD_OUTPUT_HANDLE);\n";
+        wrapper << "    HANDLE hStdOut = GetStdHandle(STD_OUTPUT_HANDLE);" << '\n';
     }
-    
+
     // Конвертуємо асемблерні інструкції в C++ код
     for (size_t i = 0; i < codeLines.size(); i++) {
         const auto& codeLine = codeLines[i];
@@ -996,46 +1144,87 @@ int main() {
         for (char& c : lowerLine) c = tolower(c);
         string trimmed = codeLine;
         while (!trimmed.empty() && isspace(trimmed[0])) trimmed.erase(0, 1);
-        
+
         // Пропускаємо PROC/ENDP/EXTERN/END
         if (lowerLine.find("proc") != string::npos || lowerLine.find("endp") != string::npos) continue;
         if (lowerLine.find("extern") != string::npos) continue;
         if (lowerLine.find("end") != string::npos && trimmed.length() <= 5) continue;
-        
+
         // Конвертуємо інструкції
         if (lowerLine.find("call exitprocess") != string::npos) {
-            wrapper << "    ExitProcess(0);\n";
-        } else if (lowerLine.find("call writefile") != string::npos) {
+            wrapper << "    ExitProcess(0);" << '\n';
+        }
+        else if (lowerLine.find("call writefile") != string::npos) {
             if (!bufferVar.empty() && !lengthVar.empty()) {
-                wrapper << "    DWORD written;\n";
-                wrapper << "    WriteFile(hStdOut, " << bufferVar << ", " << lengthVar << ", &written, NULL);\n";
-            } else if (!bufferVar.empty()) {
-                // Спробуємо знайти довжину
-                string lenVar = bufferVar;
-                if (lenVar == "msg" || lenVar == "hello") lenVar = "len";
-                else if (lenVar.find("msg") != string::npos) lenVar = lenVar + "_len";
-                wrapper << "    DWORD written;\n";
-                wrapper << "    WriteFile(hStdOut, " << bufferVar << ", sizeof(" << bufferVar << "), &written, NULL);\n";
+                // Перевіряємо, чи змінні валідні
+                bool validBuffer = !bufferVar.empty() && isalpha(static_cast<unsigned char>(bufferVar[0]));
+                bool validLength = !lengthVar.empty() && (isalpha(static_cast<unsigned char>(lengthVar[0])) || isdigit(static_cast<unsigned char>(lengthVar[0])));
+                if (validBuffer && validLength) {
+                    wrapper << "    DWORD written;" << '\n';
+                    wrapper << "    WriteFile(hStdOut, " << bufferVar << ", " << lengthVar << ", &written, NULL);" << '\n';
+                }
             }
-        } else if (lowerLine.find("ret") != string::npos && i == codeLines.size() - 1) {
+            else if (!bufferVar.empty()) {
+                // Перевіряємо, чи змінна валідна
+                if (isalpha(static_cast<unsigned char>(bufferVar[0]))) {
+                    // Спробуємо знайти довжину
+                    string lenVar = bufferVar;
+                    if (lenVar == "msg" || lenVar == "hello") lenVar = "len";
+                    else if (lenVar.find("msg") != string::npos) lenVar = lenVar + "_len";
+                    wrapper << "    DWORD written;" << '\n';
+                    wrapper << "    WriteFile(hStdOut, " << bufferVar << ", sizeof(" << bufferVar << "), &written, NULL);" << '\n';
+                }
+            }
+        }
+        else if (lowerLine.find("ret") != string::npos && i == codeLines.size() - 1) {
             // Останній ret
-            wrapper << "    return 0;\n";
+            wrapper << "    return 0;" << '\n';
         }
         // Інші інструкції (mov, add, sub тощо) пропускаємо, оскільки вони обробляються через виклики функцій
     }
-    
-    wrapper << "    return 0;\n";
-    wrapper << "}\n";
+
+    wrapper << "    return 0;" << '\n';
+    wrapper << "}" << '\n';
+
+    // Перевіряємо, чи файл записано правильно
+    if (!wrapper.good()) {
+        cerr << "Error: Failed to write wrapper file\n";
+        wrapper.close();
+        return 1;
+    }
+
     wrapper.close();
-    
+
+    // Перевіряємо, чи файл створено
+    if (!fileExists(cppWrapper)) {
+        cerr << "Error: Wrapper file was not created\n";
+        return 1;
+    }
+
+    // Перевіряємо згенерований файл на наявність помилок
+    ifstream checkWrapper(cppWrapper);
+    if (!checkWrapper.is_open()) {
+        cerr << "Error: Cannot read generated wrapper file\n";
+        return 1;
+    }
+
+    string firstLine;
+    getline(checkWrapper, firstLine);
+    checkWrapper.close();
+
+    // Перевіряємо, чи файл починається правильно
+    if (firstLine.find("//") == string::npos && firstLine.find("#include") == string::npos) {
+        cerr << "Warning: Generated wrapper file may have formatting issues\n";
+    }
+
     // Компілюємо C++ обгортку через cl.exe
     cout << "Compiling C++ wrapper...\n";
-    
+
     // Шукаємо cl.exe та налаштовуємо середовище
     string clPath;
     string vsPath = getEnvVar("VCINSTALLDIR");
     int compileResult = -1;
-    
+
     // Функція для пошуку cl.exe
     auto findClPath = [&]() -> string {
         // 1. Перевіряємо PATH
@@ -1043,7 +1232,7 @@ int main() {
         if (system(testCmd.c_str()) == 0) {
             return "cl.exe";
         }
-        
+
         // 2. Перевіряємо VCINSTALLDIR
         if (!vsPath.empty()) {
             string testClPath = vsPath + "bin\\Hostx64\\x64\\cl.exe";
@@ -1051,7 +1240,7 @@ int main() {
                 return testClPath;
             }
         }
-        
+
         // 3. Перевіряємо стандартні місця Visual Studio
         vector<string> commonPaths = {
             "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\",
@@ -1064,7 +1253,7 @@ int main() {
             "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Professional\\VC\\Tools\\MSVC\\",
             "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Enterprise\\VC\\Tools\\MSVC\\"
         };
-        
+
         for (const auto& basePath : commonPaths) {
             string searchCmd = "dir /b /s \"" + basePath + "*\\bin\\Hostx64\\x64\\cl.exe\" 2>nul";
             FILE* pipe = _popen(searchCmd.c_str(), "r");
@@ -1072,28 +1261,37 @@ int main() {
                 char buffer[512];
                 if (fgets(buffer, sizeof(buffer), pipe)) {
                     string result(buffer);
-                    result.erase(result.find_last_not_of(" \n\r\t") + 1);
+                    size_t lastPos = result.find_last_not_of(" \n\r\t");
+                    if (lastPos != string::npos) {
+                        result.erase(lastPos + 1);
+                    }
+                    else {
+                        result.clear();
+                    }
                     _pclose(pipe);
                     if (fileExists(result)) {
                         return result;
                     }
                 }
-                _pclose(pipe);
+                else {
+                    _pclose(pipe);
+                }
             }
         }
-        
+
         return "";
-    };
-    
+        };
+
     clPath = findClPath();
-    
+
     // Якщо cl.exe не знайдено в PATH, налаштовуємо середовище через vcvarsall.bat
     if (clPath.empty() || clPath == "cl.exe") {
         string vcvarsPath;
-        
+
         if (!vsPath.empty()) {
             vcvarsPath = vsPath + "Auxiliary\\Build\\vcvarsall.bat";
-        } else {
+        }
+        else {
             // Шукаємо vcvarsall.bat в стандартних місцях
             vector<string> vcvarsPaths = {
                 "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Auxiliary\\Build\\vcvarsall.bat",
@@ -1103,7 +1301,7 @@ int main() {
                 "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Professional\\VC\\Auxiliary\\Build\\vcvarsall.bat",
                 "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Enterprise\\VC\\Auxiliary\\Build\\vcvarsall.bat"
             };
-            
+
             for (const auto& path : vcvarsPaths) {
                 if (fileExists(path)) {
                     vcvarsPath = path;
@@ -1111,7 +1309,7 @@ int main() {
                 }
             }
         }
-        
+
         if (!vcvarsPath.empty() && fileExists(vcvarsPath)) {
             // Використовуємо vcvarsall.bat для налаштування середовища
             string setupCmd = "\"" + vcvarsPath + "\" x64 >nul 2>&1 && cl.exe /EHsc /Fe:program.exe " + cppWrapper + " kernel32.lib";
@@ -1121,24 +1319,26 @@ int main() {
             }
         }
     }
-    
+
     // Якщо все ще не знайдено, спробуємо прямий виклик
     if (compileResult != 0) {
         if (!clPath.empty()) {
             if (clPath == "cl.exe") {
                 string compileCmd = "cl.exe /EHsc /Fe:program.exe " + cppWrapper + " kernel32.lib";
                 compileResult = system(compileCmd.c_str());
-            } else {
+            }
+            else {
                 string compileCmd = "\"" + clPath + "\" /EHsc /Fe:program.exe " + cppWrapper + " kernel32.lib";
                 compileResult = system(compileCmd.c_str());
             }
-        } else {
+        }
+        else {
             // Остання спроба - просто cl.exe
             string compileCmd = "cl.exe /EHsc /Fe:program.exe " + cppWrapper + " kernel32.lib";
             compileResult = system(compileCmd.c_str());
         }
     }
-    
+
     if (compileResult != 0) {
         cerr << "\n========================================\n";
         cerr << "ERROR: C++ compiler (cl.exe) not found!\n";
@@ -1158,11 +1358,11 @@ int main() {
         remove(cppWrapper.c_str());
         return 1;
     }
-    
+
     // Видаляємо тимчасові файли
     remove(cppWrapper.c_str());
     remove("program_wrapper.obj");
-    
+
     cout << "Build successful! Executable: program.exe\n";
 
     // 7. Запуск програми (опціонально)
@@ -1170,8 +1370,8 @@ int main() {
     cout << "Run program? (y/n): ";
     cin >> run;
     if (run == 'y' || run == 'Y') {
-    cout << "Running program:\n";
-    system("program.exe");
+        cout << "Running program:\n";
+        system("program.exe");
     }
 
     return 0;

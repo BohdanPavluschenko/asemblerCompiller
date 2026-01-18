@@ -13,7 +13,7 @@ main PROC
     call GetStdHandle
     mov rcx, rax
     mov rdx, offset hello
-    mov r8d, hello_len
+    mov r8d, offset hello_len
     lea r9, [rsp+40]
     mov dword ptr [rsp+40], 0
     mov qword ptr [rsp+32], 0
